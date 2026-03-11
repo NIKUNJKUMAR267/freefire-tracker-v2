@@ -1,0 +1,16 @@
+*.iml
+.gradle
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Google Services — DO NOT commit this file
+app/google-services.json
+
+# Build outputs
+app/build/

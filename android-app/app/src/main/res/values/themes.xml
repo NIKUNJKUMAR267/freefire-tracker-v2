@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.FreeFire" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">#FF6B35</item>
+        <item name="colorPrimaryVariant">#CC4400</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+
+        <!-- Secondary brand color -->
+        <item name="colorSecondary">#00D2A0</item>
+        <item name="colorSecondaryVariant">#00A07A</item>
+        <item name="colorOnSecondary">#000000</item>
+
+        <!-- Background / Surface -->
+        <item name="android:colorBackground">#0D1117</item>
+        <item name="colorSurface">#161B22</item>
+        <item name="colorOnSurface">#C9D1D9</item>
+
+        <!-- Status bar -->
+        <item name="android:statusBarColor">#0D1117</item>
+        <item name="android:navigationBarColor">#0D1117</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

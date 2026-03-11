@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FF Stats Tracker</string>
+    <string name="app_name_full">FreeFire Live Stats Tracker</string>
+    <string name="permission_overlay_title">Overlay Permission Required</string>
+    <string name="permission_overlay_message">This app needs permission to draw over other apps in order to show the live stats HUD while you play Free Fire.</string>
+    <string name="perm_granted">Granted</string>
+    <string name="perm_grant">Grant</string>
+    <string name="tracking_start">START TRACKING</string>
+    <string name="tracking_stop">STOP TRACKING</string>
+    <string name="notification_capture_title">FreeFire Stats Tracker</string>
+    <string name="notification_capture_text">Tracking game stats in background</string>
+    <string name="notification_hud_title">FF Stats HUD Active</string>
+    <string name="notification_hud_text">Overlay showing live game stats</string>
+</resources>

@@ -1,0 +1,27 @@
+IMPORTANT: Replace this file with your real google-services.json from Firebase Console.
+
+Steps to get your google-services.json:
+1. Go to https://console.firebase.google.com
+2. Open your Firebase project (or create one)
+3. Click the Android icon to add an Android app
+4. Enter package name: com.livewin.freefiretracker
+5. Download google-services.json
+6. Place it in: android-app/app/google-services.json
+   (rename this file — remove the .PLACEHOLDER extension)
+
+Required Firebase services to enable in your project:
+  - Cloud Firestore (Database)
+  - Analytics (optional but recommended)
+
+Firestore collection structure expected:
+  contests/{contestId}
+    - roomId: string      (e.g. "ABC123")
+    - status: string      (e.g. "running" | "waiting" | "ended")
+
+  contests/{contestId}/liveScores/{playerId}
+    - kills: number
+    - rank: number
+    - playersAlive: number
+    - playerDead: boolean
+    - cheatFlagged: boolean
+    - lastUpdated: timestamp (millis)
