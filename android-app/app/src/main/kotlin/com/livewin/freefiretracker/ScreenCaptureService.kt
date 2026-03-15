@@ -32,13 +32,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * ScreenCaptureService is a Foreground Service that:
- * 1. Sets up a MediaProjection virtual display
- * 2. Captures a screenshot every CAPTURE_INTERVAL_MS (2 seconds)
- * 3. Passes each frame to OcrProcessor
- * 4. Feeds OCR results into GameStateMachine and AntiCheatManager
- * 5. Writes live scores to Firebase via FirebaseManager
- * 6. Updates the OverlayHudService with latest stats
+ * ScreenCaptureService — Foreground service that:
+ * 1. Captures screen every 2 seconds via MediaProjection
+ * 2. Runs OCR to extract kills, alive count, roomId, death state
+ * 3. Feeds data into GameStateMachine + AntiCheatManager
+ * 4. Writes live scores to Firestore (contests OR userRooms)
+ * 5. On MATCH_ENDED: declares winners, credits coins, sends notifications
+ * 6. Updates OverlayHudService with latest stats
  */
 class ScreenCaptureService : Service() {
 
@@ -52,91 +52,85 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_PROJECTION_DATA = "extra_projection_data"
         const val EXTRA_PLAYER_ID = "extra_player_id"
+        const val EXTRA_PLAYER_NAME = "extra_player_name"
         const val ACTION_STOP = "com.livewin.freefiretracker.STOP_CAPTURE"
 
         fun buildStartIntent(
             context: Context,
             resultCode: Int,
             projectionData: Intent,
-            playerId: String
+            playerId: String,
+            playerName: String = ""
         ): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_PROJECTION_DATA, projectionData)
                 putExtra(EXTRA_PLAYER_ID, playerId)
+                putExtra(EXTRA_PLAYER_NAME, playerName)
             }
         }
     }
 
-    // --- Coroutine scope for all async work ---
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var captureJob: Job? = null
 
-    // --- MediaProjection components ---
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
 
-    // --- Screen metrics ---
     private var screenWidth = 0
     private var screenHeight = 0
     private var screenDensity = 0
 
-    // --- Core business logic ---
     private lateinit var ocrProcessor: OcrProcessor
     private lateinit var gameStateMachine: GameStateMachine
     private lateinit var antiCheatManager: AntiCheatManager
     private lateinit var firebaseManager: FirebaseManager
 
-    // --- Accumulated stats ---
     private var currentStats = GameStats()
     private var playerId: String = "unknown_player"
+    private var playerName: String = ""
 
-    // --- Main thread handler (WindowManager updates must be on main thread) ---
+    // Track last state to detect transitions
+    private var lastGameState: GameState = GameState.IDLE
+    private var winnerDeclarationAttempted = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "ScreenCaptureService created")
-
         ocrProcessor = OcrProcessor()
         gameStateMachine = GameStateMachine()
         antiCheatManager = AntiCheatManager()
-
         createNotificationChannel()
         startForeground(NOTIF_ID_CAPTURE, buildNotification("Initializing..."))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            Log.i(TAG, "Stop command received")
-            tearDown()
-            stopSelf()
+            tearDown(); stopSelf()
             return START_NOT_STICKY
         }
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
         val projectionData = intent?.getParcelableExtra<Intent>(EXTRA_PROJECTION_DATA)
         playerId = intent?.getStringExtra(EXTRA_PLAYER_ID) ?: "unknown_player"
+        playerName = intent?.getStringExtra(EXTRA_PLAYER_NAME) ?: ""
 
         if (resultCode == -1 || projectionData == null) {
-            Log.e(TAG, "Invalid MediaProjection data received. Stopping service.")
-            stopSelf()
-            return START_NOT_STICKY
+            Log.e(TAG, "Invalid MediaProjection data. Stopping.")
+            stopSelf(); return START_NOT_STICKY
         }
 
         firebaseManager = FirebaseManager(playerId)
         antiCheatManager.startNewSession()
+        winnerDeclarationAttempted = false
 
         setupMediaProjection(resultCode, projectionData)
         startCaptureLoop()
-
-        // Start the overlay HUD
-        val hudIntent = Intent(this, OverlayHudService::class.java)
-        startForegroundService(hudIntent)
-
+        startForegroundService(Intent(this, OverlayHudService::class.java))
         updateNotification("Tracking active — watching for game...")
         return START_STICKY
     }
@@ -147,57 +141,24 @@ class ScreenCaptureService : Service() {
 
     private fun setupMediaProjection(resultCode: Int, data: Intent) {
         val metrics = DisplayMetrics()
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-
         @Suppress("DEPRECATION")
-        wm.defaultDisplay.getMetrics(metrics)
-
+        (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getMetrics(metrics)
         screenWidth = metrics.widthPixels
         screenHeight = metrics.heightPixels
         screenDensity = metrics.densityDpi
 
-        Log.i(TAG, "Screen: ${screenWidth}x${screenHeight} @ ${screenDensity}dpi")
-
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpm.getMediaProjection(resultCode, data)
-
-        if (mediaProjection == null) {
-            Log.e(TAG, "MediaProjection is null — cannot capture screen")
-            stopSelf()
-            return
-        }
-
-        // Register callback to handle projection stop from the system
         mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                Log.w(TAG, "MediaProjection stopped externally")
-                tearDown()
-                stopSelf()
-            }
+            override fun onStop() { tearDown(); stopSelf() }
         }, mainHandler)
 
-        setupVirtualDisplay()
-    }
-
-    private fun setupVirtualDisplay() {
-        imageReader = ImageReader.newInstance(
-            screenWidth,
-            screenHeight,
-            PixelFormat.RGBA_8888,
-            2
-        )
-
+        imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
         virtualDisplay = mediaProjection?.createVirtualDisplay(
-            VIRTUAL_DISPLAY_NAME,
-            screenWidth,
-            screenHeight,
-            screenDensity,
+            VIRTUAL_DISPLAY_NAME, screenWidth, screenHeight, screenDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface,
-            null,
-            mainHandler
+            imageReader?.surface, null, mainHandler
         )
-
         Log.i(TAG, "VirtualDisplay created: ${screenWidth}x${screenHeight}")
     }
 
@@ -208,13 +169,10 @@ class ScreenCaptureService : Service() {
     private fun startCaptureLoop() {
         captureJob?.cancel()
         captureJob = serviceScope.launch {
-            Log.i(TAG, "Capture loop started — interval: ${CAPTURE_INTERVAL_MS}ms")
+            Log.i(TAG, "Capture loop started")
             while (true) {
-                try {
-                    captureAndProcess()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error during capture cycle", e)
-                }
+                try { captureAndProcess() }
+                catch (e: Exception) { Log.e(TAG, "Capture error", e) }
                 delay(CAPTURE_INTERVAL_MS)
             }
         }
@@ -224,24 +182,23 @@ class ScreenCaptureService : Service() {
         val bitmap = acquireLatestFrame() ?: return
 
         try {
-            // 1. Run OCR on the captured frame
+            // 1. OCR
             val ocr = ocrProcessor.process(bitmap)
 
-            // 2. Anti-cheat: validate alive count monotonicity
+            // 2. Anti-cheat
             val aliveValid = antiCheatManager.validateAliveCount(ocr.playersAlive)
             val cheatFlagged = antiCheatManager.cheatFlagged
 
-            // 3. Update game state machine
+            // 3. State machine
             gameStateMachine.onOcrResult(
                 detectedRoomId = ocr.roomId,
                 kills = ocr.kills,
                 playersAlive = if (aliveValid) ocr.playersAlive else currentStats.playersAlive,
                 playerDead = ocr.playerDeathDetected
             )
-
             val gameState = gameStateMachine.getCurrent()
 
-            // 4. Build updated stats
+            // 4. Build stats
             currentStats = GameStats(
                 kills = ocr.kills,
                 rank = estimateRank(ocr.playersAlive),
@@ -251,16 +208,20 @@ class ScreenCaptureService : Service() {
                 lastUpdated = System.currentTimeMillis()
             )
 
-            // 5. Write to Firebase (only during active game states)
+            // 5. Handle state transitions
+            handleStateTransition(gameState, ocr.roomId, cheatFlagged)
+
+            // 6. Write live scores during active match
             if (shouldUploadStats(gameState)) {
                 firebaseManager.updateLiveScore(
                     detectedRoomId = ocr.roomId ?: gameStateMachine.getLastRoomId(),
                     stats = currentStats,
-                    cheatFlagged = cheatFlagged
+                    cheatFlagged = cheatFlagged,
+                    playerName = playerName
                 )
             }
 
-            // 6. Update the overlay HUD
+            // 7. Update HUD
             val hudIntent = OverlayHudService.buildUpdateIntent(
                 context = this@ScreenCaptureService,
                 stats = currentStats,
@@ -269,31 +230,89 @@ class ScreenCaptureService : Service() {
             )
             startService(hudIntent)
 
-            // 7. Broadcast state update to MainActivity
+            // 8. Broadcast to MainActivity
             sendStateBroadcast(gameState, currentStats, cheatFlagged)
 
-            Log.v(TAG, "Cycle done: state=$gameState kills=${ocr.kills} alive=${ocr.playersAlive} roomId=${ocr.roomId}")
+            lastGameState = gameState
 
         } finally {
             bitmap.recycle()
         }
     }
 
-    private fun acquireLatestFrame(): Bitmap? {
-        val reader = imageReader ?: return null
+    // ─────────────────────────────────────────────────────────────────────────
+    // State Transition Handler
+    // ─────────────────────────────────────────────────────────────────────────
 
-        val image: Image? = try {
-            reader.acquireLatestImage()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to acquire image", e)
-            return null
-        } ?: return null
-
-        return try {
-            imageToBitmap(image)
-        } finally {
-            image.close()
+    private suspend fun handleStateTransition(
+        gameState: GameState,
+        detectedRoomId: String?,
+        cheatFlagged: Boolean
+    ) {
+        // Trigger winner declaration ONCE when state first becomes MATCH_ENDED
+        if (gameState == GameState.MATCH_ENDED && lastGameState != GameState.MATCH_ENDED) {
+            if (!winnerDeclarationAttempted) {
+                winnerDeclarationAttempted = true
+                triggerWinnerDeclaration()
+            }
         }
+
+        // Reset winner flag if we go back to IDLE (new game started)
+        if (gameState == GameState.IDLE && lastGameState == GameState.MATCH_ENDED) {
+            winnerDeclarationAttempted = false
+            firebaseManager.clearActiveContest()
+            antiCheatManager.startNewSession()
+        }
+
+        // Auto-find contest when Room ID is first detected
+        if (gameState == GameState.ROOM_JOIN && !detectedRoomId.isNullOrBlank()) {
+            if (firebaseManager.getActiveContest() == null) {
+                val contest = firebaseManager.findRunningContest(detectedRoomId)
+                if (contest != null) {
+                    updateNotification("Contest found: ${contest.name}")
+                    Log.i(TAG, "Auto-found contest: ${contest.contestId}")
+                } else {
+                    Log.d(TAG, "No running contest for roomId=$detectedRoomId")
+                }
+            }
+        }
+    }
+
+    /**
+     * Called exactly once when MATCH_ENDED state is detected.
+     * Declares winners, credits coins, sends notifications.
+     */
+    private suspend fun triggerWinnerDeclaration() {
+        val contest = firebaseManager.getActiveContest()
+        if (contest == null) {
+            Log.w(TAG, "MATCH_ENDED but no active contest found — cannot declare winners")
+            updateNotification("Match ended — no linked contest found")
+            return
+        }
+
+        Log.i(TAG, "Match ended! Declaring winners for contest: ${contest.contestId}")
+        updateNotification("Match ended! Declaring winners...")
+
+        val success = firebaseManager.declareWinners(contest)
+        if (success) {
+            updateNotification("Winners declared! Coins credited to winners.")
+            Log.i(TAG, "Winner declaration successful")
+        } else {
+            updateNotification("Match ended — winner declaration failed, check logs")
+            Log.w(TAG, "Winner declaration returned false")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Frame Capture
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun acquireLatestFrame(): Bitmap? {
+        val image: Image? = try {
+            imageReader?.acquireLatestImage()
+        } catch (e: Exception) { null } ?: return null
+
+        return try { imageToBitmap(image!!) } finally { image!!.close() }
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
@@ -306,21 +325,16 @@ class ScreenCaptureService : Service() {
 
             val bitmap = Bitmap.createBitmap(
                 screenWidth + rowPadding / pixelStride,
-                screenHeight,
-                Bitmap.Config.ARGB_8888
+                screenHeight, Bitmap.Config.ARGB_8888
             )
             bitmap.copyPixelsFromBuffer(buffer)
 
-            // Crop to exact screen size (removes row padding)
             if (rowPadding > 0) {
-                Bitmap.createBitmap(bitmap, 0, 0, screenWidth, screenHeight).also {
-                    bitmap.recycle()
-                }
-            } else {
-                bitmap
-            }
+                Bitmap.createBitmap(bitmap, 0, 0, screenWidth, screenHeight)
+                    .also { bitmap.recycle() }
+            } else bitmap
         } catch (e: Exception) {
-            Log.e(TAG, "Error converting Image to Bitmap", e)
+            Log.e(TAG, "Bitmap conversion error", e)
             null
         }
     }
@@ -329,32 +343,23 @@ class ScreenCaptureService : Service() {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun shouldUploadStats(state: GameState): Boolean {
-        return state in listOf(
-            GameState.IN_MATCH,
-            GameState.PLAYER_DEAD,
-            GameState.MATCH_ENDED
-        )
-    }
+    private fun shouldUploadStats(state: GameState): Boolean = state in listOf(
+        GameState.IN_MATCH, GameState.PLAYER_DEAD
+    )
 
-    /**
-     * Estimate rank from alive count (simple heuristic: rank ≈ playersAlive).
-     * In Free Fire, when you die, your rank is approximately how many players were alive.
-     */
-    private fun estimateRank(playersAlive: Int): Int {
-        return if (playersAlive > 0) playersAlive else currentStats.rank
-    }
+    private fun estimateRank(playersAlive: Int): Int =
+        if (playersAlive > 0) playersAlive else currentStats.rank
 
     private fun sendStateBroadcast(state: GameState, stats: GameStats, cheatFlagged: Boolean) {
-        val broadcast = Intent(MainActivity.ACTION_STATS_UPDATE).apply {
+        sendBroadcast(Intent(MainActivity.ACTION_STATS_UPDATE).apply {
             putExtra(MainActivity.EXTRA_GAME_STATE, state.name)
             putExtra(MainActivity.EXTRA_KILLS, stats.kills)
             putExtra(MainActivity.EXTRA_ALIVE, stats.playersAlive)
             putExtra(MainActivity.EXTRA_DEAD, stats.playerDead)
             putExtra(MainActivity.EXTRA_CHEAT, cheatFlagged)
             putExtra(MainActivity.EXTRA_CONTEST_ID, firebaseManager.getActiveContestId() ?: "")
-        }
-        sendBroadcast(broadcast)
+            putExtra("extra_collection", firebaseManager.getActiveContest()?.collectionName ?: "")
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -363,30 +368,22 @@ class ScreenCaptureService : Service() {
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
-            NOTIF_CHANNEL_CAPTURE,
-            "Screen Capture",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "FreeFire screen capture service"
-            setShowBadge(false)
-        }
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(channel)
+            NOTIF_CHANNEL_CAPTURE, "Screen Capture", NotificationManager.IMPORTANCE_LOW
+        ).apply { setShowBadge(false) }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification(statusText: String): Notification {
+    private fun buildNotification(text: String): Notification {
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_CAPTURE)
             .setContentTitle("FreeFire Stats Tracker")
-            .setContentText(statusText)
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .addAction(
-                android.R.drawable.ic_delete,
-                "Stop",
+                android.R.drawable.ic_delete, "Stop",
                 android.app.PendingIntent.getService(
-                    this,
-                    0,
+                    this, 0,
                     Intent(this, ScreenCaptureService::class.java).apply { action = ACTION_STOP },
                     android.app.PendingIntent.FLAG_IMMUTABLE
                 )
@@ -395,8 +392,7 @@ class ScreenCaptureService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID_CAPTURE, buildNotification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID_CAPTURE, buildNotification(text))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -405,23 +401,12 @@ class ScreenCaptureService : Service() {
 
     private fun tearDown() {
         captureJob?.cancel()
-        captureJob = null
-
         virtualDisplay?.release()
-        virtualDisplay = null
-
         imageReader?.close()
-        imageReader = null
-
         mediaProjection?.stop()
-        mediaProjection = null
-
         ocrProcessor.close()
-
-        // Stop HUD
         stopService(Intent(this, OverlayHudService::class.java))
-
-        Log.i(TAG, "ScreenCaptureService torn down")
+        Log.i(TAG, "Service torn down")
     }
 
     override fun onDestroy() {

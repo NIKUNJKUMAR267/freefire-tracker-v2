@@ -77,6 +77,9 @@ class MainActivity : AppCompatActivity() {
     private var isServiceRunning = false
     private var pendingProjectionData: Intent? = null
 
+    // Player info input
+    private lateinit var etPlayerName: android.widget.EditText
+
     // ─── MediaProjection launcher ─────────────────────────────────────────────
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -112,8 +115,9 @@ class MainActivity : AppCompatActivity() {
             val dead = intent.getBooleanExtra(EXTRA_DEAD, false)
             val cheat = intent.getBooleanExtra(EXTRA_CHEAT, false)
             val contestId = intent.getStringExtra(EXTRA_CONTEST_ID) ?: ""
+            val collection = intent.getStringExtra("extra_collection") ?: ""
 
-            updateStatsDisplay(stateName, kills, alive, dead, cheat, contestId)
+            updateStatsDisplay(stateName, kills, alive, dead, cheat, contestId, collection)
         }
     }
 
@@ -182,6 +186,21 @@ class MainActivity : AppCompatActivity() {
         tvPermCapture = permRow("Screen Capture")
         // Screen capture is requested on-demand, no separate button
 
+        // ── Player Name Input ────────────────────────────────────────────────
+        val playerSection = sectionLabel("YOUR GAME NAME (optional)")
+        etPlayerName = android.widget.EditText(this).apply {
+            hint = "Enter your Free Fire username"
+            setHintTextColor(Color.parseColor("#555555"))
+            setTextColor(Color.parseColor("#CCCCCC"))
+            textSize = 14f
+            setBackgroundColor(Color.parseColor("#161B22"))
+            setPadding(20, 16, 20, 16)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, 0) }
+        }
+
         // ── Start / Stop ────────────────────────────────────────────────────
         btnStartStop = Button(this).apply {
             text = "START TRACKING"
@@ -193,7 +212,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 32, 0, 0) }
+            ).apply { setMargins(0, 16, 0, 0) }
         }
 
         // ── Live Stats Card ──────────────────────────────────────────────────
@@ -233,6 +252,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(permRowContainer(tvPermOverlay, btnOverlayPerm))
         root.addView(permRowContainer(tvPermNotif, btnNotifPerm))
         root.addView(tvPermCapture)
+        root.addView(spacer(12))
+        root.addView(playerSection)
+        root.addView(etPlayerName)
         root.addView(btnStartStop)
         root.addView(spacer(24))
         root.addView(tvStatusLabel)
@@ -399,11 +421,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCaptureService(resultCode: Int, data: Intent) {
+        val enteredName = etPlayerName.text.toString().trim()
         val serviceIntent = ScreenCaptureService.buildStartIntent(
             context = this,
             resultCode = resultCode,
             projectionData = data,
-            playerId = DEFAULT_PLAYER_ID
+            playerId = DEFAULT_PLAYER_ID,
+            playerName = enteredName
         )
         startForegroundService(serviceIntent)
         isServiceRunning = true
@@ -443,15 +467,16 @@ class MainActivity : AppCompatActivity() {
         alive: Int,
         dead: Boolean,
         cheat: Boolean,
-        contestId: String
+        contestId: String,
+        collection: String = ""
     ) {
         val stateDisplay = when (stateName) {
             "IDLE" -> "Idle — waiting for game"
-            "ROOM_JOIN" -> "Room joined — detected lobby"
+            "ROOM_JOIN" -> "Room joined — searching contest..."
             "PRE_MATCH" -> "Pre-match lobby"
             "IN_MATCH" -> "In Match — tracking live"
             "PLAYER_DEAD" -> "Player eliminated"
-            "MATCH_ENDED" -> "Match ended"
+            "MATCH_ENDED" -> "Match ended — declaring winners..."
             else -> stateName
         }
 
@@ -464,7 +489,12 @@ class MainActivity : AppCompatActivity() {
         tvAlive.text = "Players Alive:  ${if (alive > 0) alive.toString() else "—"}"
         tvAlive.setTextColor(if (alive > 0) Color.parseColor("#00D2A0") else Color.parseColor("#C9D1D9"))
 
-        tvContestId.text = "Contest:  ${contestId.ifBlank { "Searching..." }}"
+        val contestLabel = when {
+            contestId.isBlank() -> "Searching..."
+            collection == "userRooms" -> "Custom Room: ...${contestId.takeLast(6)}"
+            else -> "Contest: ...${contestId.takeLast(6)}"
+        }
+        tvContestId.text = contestLabel
 
         if (cheat) {
             tvCheat.text = "⚠  Anti-cheat flag raised"
