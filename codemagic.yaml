@@ -12,10 +12,3 @@ workflows:
           ./gradlew assembleDebug --no-daemon
     artifacts:
       - android-app/app/build/outputs/**/*.apk
-    publishing:
-      email:
-        recipients:
-          - $CM_SUBMITTER_EMAIL
-        notify:
-          success: true
-          failure: true
