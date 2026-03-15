@@ -5,9 +5,6 @@ workflows:
     environment:
       java: 17
     scripts:
-      - name: Set up google-services.json
-        script: |
-          echo $GOOGLE_SERVICES_JSON > android-app/app/google-services.json
       - name: Build Debug APK
         script: |
           cd android-app

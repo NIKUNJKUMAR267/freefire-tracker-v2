@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "752856037565",
+    "project_id": "live2win-92817",
+    "storage_bucket": "live2win-92817.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:752856037565:android:94ffe1ef535ac3652c5fd4",
+        "android_client_info": {
+          "package_name": "com.livewin.freefiretracker"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPSE7q4Wv-7xlnUBRug-bmEzLMrlXY8AA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
