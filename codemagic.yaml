@@ -1,0 +1,24 @@
+workflows:
+  android-debug-build:
+    name: FreeFire Tracker APK
+    max_build_duration: 60
+    environment:
+      java: 17
+    scripts:
+      - name: Set up google-services.json
+        script: |
+          echo $GOOGLE_SERVICES_JSON > android-app/app/google-services.json
+      - name: Build Debug APK
+        script: |
+          cd android-app
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+    artifacts:
+      - android-app/app/build/outputs/**/*.apk
+    publishing:
+      email:
+        recipients:
+          - $CM_SUBMITTER_EMAIL
+        notify:
+          success: true
+          failure: true
