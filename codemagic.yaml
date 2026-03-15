@@ -5,10 +5,16 @@ workflows:
     environment:
       java: 17
     scripts:
+      - name: Setup Gradle Wrapper
+        script: |
+          cd android-app
+          mkdir -p gradle/wrapper
+          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.4.0/gradle/wrapper/gradle-wrapper.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
       - name: Build Debug APK
         script: |
           cd android-app
-          chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
     artifacts:
       - android-app/app/build/outputs/**/*.apk
