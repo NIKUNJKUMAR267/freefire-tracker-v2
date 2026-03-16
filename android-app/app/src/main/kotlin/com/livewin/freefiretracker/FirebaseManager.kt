@@ -1,3 +1,4 @@
+package com.livewin.freefiretracker
 import android.util.Log
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
