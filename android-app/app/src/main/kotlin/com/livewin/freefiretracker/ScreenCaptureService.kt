@@ -31,15 +31,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/**
- * ScreenCaptureService — Foreground service that:
- * 1. Captures screen every 2 seconds via MediaProjection
- * 2. Runs OCR to extract kills, alive count, roomId, death state
- * 3. Feeds data into GameStateMachine + AntiCheatManager
- * 4. Writes live scores to Firestore (contests OR userRooms)
- * 5. On MATCH_ENDED: declares winners, credits coins, sends notifications
- * 6. Updates OverlayHudService with latest stats
- */
 class ScreenCaptureService : Service() {
 
     companion object {
@@ -91,7 +82,9 @@ class ScreenCaptureService : Service() {
     private var playerId: String = "unknown_player"
     private var playerName: String = ""
 
-    // Track last state to detect transitions
+    // Last detected roomId cache
+    private var lastDetectedRoomId: String? = null
+
     private var lastGameState: GameState = GameState.IDLE
     private var winnerDeclarationAttempted = false
 
@@ -127,6 +120,7 @@ class ScreenCaptureService : Service() {
         firebaseManager = FirebaseManager(playerId)
         antiCheatManager.startNewSession()
         winnerDeclarationAttempted = false
+        lastDetectedRoomId = null
 
         setupMediaProjection(resultCode, projectionData)
         startCaptureLoop()
@@ -185,11 +179,16 @@ class ScreenCaptureService : Service() {
             // 1. OCR
             val ocr = ocrProcessor.process(bitmap)
 
-            // 2. Anti-cheat
+            // 2. RoomId cache update karo
+            if (!ocr.roomId.isNullOrBlank()) {
+                lastDetectedRoomId = ocr.roomId
+            }
+
+            // 3. Anti-cheat
             val aliveValid = antiCheatManager.validateAliveCount(ocr.playersAlive)
             val cheatFlagged = antiCheatManager.cheatFlagged
 
-            // 3. State machine
+            // 4. State machine
             gameStateMachine.onOcrResult(
                 detectedRoomId = ocr.roomId,
                 kills = ocr.kills,
@@ -198,7 +197,7 @@ class ScreenCaptureService : Service() {
             )
             val gameState = gameStateMachine.getCurrent()
 
-            // 4. Build stats
+            // 5. Build stats
             currentStats = GameStats(
                 kills = ocr.kills,
                 rank = estimateRank(ocr.playersAlive),
@@ -208,20 +207,23 @@ class ScreenCaptureService : Service() {
                 lastUpdated = System.currentTimeMillis()
             )
 
-            // 5. Handle state transitions
+            // 6. Handle state transitions
             handleStateTransition(gameState, ocr.roomId, cheatFlagged)
 
-            // 6. Write live scores during active match
+            // 7. Write live scores — activePlayers + deadPlayers bhi bhejo
             if (shouldUploadStats(gameState)) {
                 firebaseManager.updateLiveScore(
-                    detectedRoomId = ocr.roomId ?: gameStateMachine.getLastRoomId(),
+                    detectedRoomId = lastDetectedRoomId
+                        ?: firebaseManager.getLastRoomId(),
                     stats = currentStats,
                     cheatFlagged = cheatFlagged,
-                    playerName = playerName
+                    playerName = playerName,
+                    activePlayers = ocr.activePlayers,   // ← Naya
+                    deadPlayers = ocr.deadPlayers         // ← Naya
                 )
             }
 
-            // 7. Update HUD
+            // 8. Update HUD
             val hudIntent = OverlayHudService.buildUpdateIntent(
                 context = this@ScreenCaptureService,
                 stats = currentStats,
@@ -230,7 +232,7 @@ class ScreenCaptureService : Service() {
             )
             startService(hudIntent)
 
-            // 8. Broadcast to MainActivity
+            // 9. Broadcast to MainActivity
             sendStateBroadcast(gameState, currentStats, cheatFlagged)
 
             lastGameState = gameState
@@ -249,7 +251,6 @@ class ScreenCaptureService : Service() {
         detectedRoomId: String?,
         cheatFlagged: Boolean
     ) {
-        // Trigger winner declaration ONCE when state first becomes MATCH_ENDED
         if (gameState == GameState.MATCH_ENDED && lastGameState != GameState.MATCH_ENDED) {
             if (!winnerDeclarationAttempted) {
                 winnerDeclarationAttempted = true
@@ -257,14 +258,13 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        // Reset winner flag if we go back to IDLE (new game started)
         if (gameState == GameState.IDLE && lastGameState == GameState.MATCH_ENDED) {
             winnerDeclarationAttempted = false
+            lastDetectedRoomId = null
             firebaseManager.clearActiveContest()
             antiCheatManager.startNewSession()
         }
 
-        // Auto-find contest when Room ID is first detected
         if (gameState == GameState.ROOM_JOIN && !detectedRoomId.isNullOrBlank()) {
             if (firebaseManager.getActiveContest() == null) {
                 val contest = firebaseManager.findRunningContest(detectedRoomId)
@@ -278,27 +278,23 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    /**
-     * Called exactly once when MATCH_ENDED state is detected.
-     * Declares winners, credits coins, sends notifications.
-     */
     private suspend fun triggerWinnerDeclaration() {
         val contest = firebaseManager.getActiveContest()
         if (contest == null) {
-            Log.w(TAG, "MATCH_ENDED but no active contest found — cannot declare winners")
+            Log.w(TAG, "MATCH_ENDED but no active contest found")
             updateNotification("Match ended — no linked contest found")
             return
         }
 
-        Log.i(TAG, "Match ended! Declaring winners for contest: ${contest.contestId}")
+        Log.i(TAG, "Declaring winners for: ${contest.contestId}")
         updateNotification("Match ended! Declaring winners...")
 
         val success = firebaseManager.declareWinners(contest)
         if (success) {
-            updateNotification("Winners declared! Coins credited to winners.")
+            updateNotification("Winners declared! Coins credited.")
             Log.i(TAG, "Winner declaration successful")
         } else {
-            updateNotification("Match ended — winner declaration failed, check logs")
+            updateNotification("Winner declaration failed, check logs")
             Log.w(TAG, "Winner declaration returned false")
         }
     }
@@ -311,7 +307,6 @@ class ScreenCaptureService : Service() {
         val image: Image? = try {
             imageReader?.acquireLatestImage()
         } catch (e: Exception) { null } ?: return null
-
         return try { imageToBitmap(image!!) } finally { image!!.close() }
     }
 
@@ -358,7 +353,8 @@ class ScreenCaptureService : Service() {
             putExtra(MainActivity.EXTRA_DEAD, stats.playerDead)
             putExtra(MainActivity.EXTRA_CHEAT, cheatFlagged)
             putExtra(MainActivity.EXTRA_CONTEST_ID, firebaseManager.getActiveContestId() ?: "")
-            putExtra("extra_collection", firebaseManager.getActiveContest()?.collectionName ?: "")
+            putExtra("extra_collection",
+                firebaseManager.getActiveContest()?.collectionName ?: "")
         })
     }
 
@@ -384,7 +380,9 @@ class ScreenCaptureService : Service() {
                 android.R.drawable.ic_delete, "Stop",
                 android.app.PendingIntent.getService(
                     this, 0,
-                    Intent(this, ScreenCaptureService::class.java).apply { action = ACTION_STOP },
+                    Intent(this, ScreenCaptureService::class.java).apply {
+                        action = ACTION_STOP
+                    },
                     android.app.PendingIntent.FLAG_IMMUTABLE
                 )
             )
@@ -392,7 +390,8 @@ class ScreenCaptureService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID_CAPTURE, buildNotification(text))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIF_ID_CAPTURE, buildNotification(text))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
