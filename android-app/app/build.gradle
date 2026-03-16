@@ -16,6 +16,10 @@ android {
         versionName "1.0.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Claude API Key â€” Codemagic environment variable se inject hoga
+        buildConfigField "String", "CLAUDE_API_KEY",
+            "\"${System.getenv('CLAUDE_API_KEY') ?: ''}\""
     }
 
     buildTypes {
@@ -27,6 +31,7 @@ android {
 
     buildFeatures {
         viewBinding true
+        buildConfig true   // â† BuildConfig enable kiya
     }
 
     compileOptions {
