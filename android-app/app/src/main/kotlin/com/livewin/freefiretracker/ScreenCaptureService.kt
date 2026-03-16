@@ -82,9 +82,7 @@ class ScreenCaptureService : Service() {
     private var playerId: String = "unknown_player"
     private var playerName: String = ""
 
-    // Last detected roomId cache
     private var lastDetectedRoomId: String? = null
-
     private var lastGameState: GameState = GameState.IDLE
     private var winnerDeclarationAttempted = false
 
@@ -179,55 +177,64 @@ class ScreenCaptureService : Service() {
             // 1. OCR
             val ocr = ocrProcessor.process(bitmap)
 
-            // 2. RoomId cache update karo
+            // 2. RoomId cache update
             if (!ocr.roomId.isNullOrBlank()) {
                 lastDetectedRoomId = ocr.roomId
             }
 
-            // 3. Anti-cheat
-            val aliveValid = antiCheatManager.validateAliveCount(ocr.playersAlive)
+            // 3. Anti-cheat (BR only — CS mein alive count nahi hota)
+            val aliveValid = if (ocr.gameMode == GameMode.BATTLE_ROYALE)
+                antiCheatManager.validateAliveCount(ocr.playersAlive)
+            else true
             val cheatFlagged = antiCheatManager.cheatFlagged
 
-            // 4. State machine
+            // 4. State machine — mode + CS fields bhi pass karo
             gameStateMachine.onOcrResult(
                 detectedRoomId = ocr.roomId,
-                kills = ocr.kills,
-                playersAlive = if (aliveValid) ocr.playersAlive else currentStats.playersAlive,
-                playerDead = ocr.playerDeathDetected
+                kills          = ocr.kills,
+                playersAlive   = if (aliveValid) ocr.playersAlive else currentStats.playersAlive,
+                playerDead     = ocr.playerDeathDetected,
+                gameMode       = ocr.gameMode,        // ← NEW
+                myTeamScore    = ocr.myTeamScore,     // ← NEW
+                enemyTeamScore = ocr.enemyTeamScore,  // ← NEW
+                totalRounds    = ocr.totalRounds      // ← NEW
             )
             val gameState = gameStateMachine.getCurrent()
 
-            // 5. Build stats
+            // 5. Build stats — CS fields bhi store karo
             currentStats = GameStats(
-                kills = ocr.kills,
-                rank = estimateRank(ocr.playersAlive),
-                playersAlive = if (aliveValid) ocr.playersAlive else currentStats.playersAlive,
-                playerDead = ocr.playerDeathDetected || gameState == GameState.PLAYER_DEAD,
-                cheatFlagged = cheatFlagged,
-                lastUpdated = System.currentTimeMillis()
+                kills          = ocr.kills,
+                rank           = estimateRank(ocr.playersAlive),
+                playersAlive   = if (aliveValid) ocr.playersAlive else currentStats.playersAlive,
+                playerDead     = ocr.playerDeathDetected || gameState == GameState.PLAYER_DEAD,
+                cheatFlagged   = cheatFlagged,
+                lastUpdated    = System.currentTimeMillis(),
+                myTeamScore    = ocr.myTeamScore,     // ← NEW
+                enemyTeamScore = ocr.enemyTeamScore,  // ← NEW
+                totalRounds    = ocr.totalRounds,     // ← NEW
+                roundTimeLeft  = ocr.roundTimeLeft    // ← NEW
             )
 
-            // 6. Handle state transitions
+            // 6. State transitions handle karo
             handleStateTransition(gameState, ocr.roomId, cheatFlagged)
 
-            // 7. Write live scores — activePlayers + deadPlayers bhi bhejo
+            // 7. Firebase upload
             if (shouldUploadStats(gameState)) {
                 firebaseManager.updateLiveScore(
-                    detectedRoomId = lastDetectedRoomId
-                        ?: firebaseManager.getLastRoomId(),
-                    stats = currentStats,
-                    cheatFlagged = cheatFlagged,
-                    playerName = playerName,
-                    activePlayers = ocr.activePlayers,   // ← Naya
-                    deadPlayers = ocr.deadPlayers         // ← Naya
+                    detectedRoomId = lastDetectedRoomId ?: firebaseManager.getLastRoomId(),
+                    stats          = currentStats,
+                    cheatFlagged   = cheatFlagged,
+                    playerName     = playerName,
+                    activePlayers  = ocr.activePlayers,
+                    deadPlayers    = ocr.deadPlayers
                 )
             }
 
-            // 8. Update HUD
+            // 8. HUD update
             val hudIntent = OverlayHudService.buildUpdateIntent(
-                context = this@ScreenCaptureService,
-                stats = currentStats,
-                state = gameState,
+                context      = this@ScreenCaptureService,
+                stats        = currentStats,
+                state        = gameState,
                 cheatFlagged = cheatFlagged
             )
             startService(hudIntent)
@@ -338,8 +345,10 @@ class ScreenCaptureService : Service() {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    // BR: IN_MATCH + PLAYER_DEAD pe upload
+    // CS: IN_MATCH + ROUND_END pe upload
     private fun shouldUploadStats(state: GameState): Boolean = state in listOf(
-        GameState.IN_MATCH, GameState.PLAYER_DEAD
+        GameState.IN_MATCH, GameState.PLAYER_DEAD, GameState.ROUND_END
     )
 
     private fun estimateRank(playersAlive: Int): Int =
@@ -353,8 +362,12 @@ class ScreenCaptureService : Service() {
             putExtra(MainActivity.EXTRA_DEAD, stats.playerDead)
             putExtra(MainActivity.EXTRA_CHEAT, cheatFlagged)
             putExtra(MainActivity.EXTRA_CONTEST_ID, firebaseManager.getActiveContestId() ?: "")
-            putExtra("extra_collection",
-                firebaseManager.getActiveContest()?.collectionName ?: "")
+            putExtra("extra_collection", firebaseManager.getActiveContest()?.collectionName ?: "")
+            // CS extras
+            putExtra("extra_my_score",     stats.myTeamScore)
+            putExtra("extra_enemy_score",  stats.enemyTeamScore)
+            putExtra("extra_total_rounds", stats.totalRounds)
+            putExtra("extra_round_time",   stats.roundTimeLeft)
         })
     }
 
