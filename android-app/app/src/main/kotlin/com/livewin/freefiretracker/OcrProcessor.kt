@@ -13,9 +13,12 @@ data class OcrResult(
     val playersAlive: Int,
     val roomId: String?,
     val playerDeathDetected: Boolean,
+    val activePlayers: List<String>,
+    val deadPlayers: List<String>,
     val rawKillsText: String,
     val rawAliveText: String,
-    val rawRoomIdText: String
+    val rawRoomIdText: String,
+    val rawPlayerListText: String
 )
 
 class OcrProcessor {
@@ -23,11 +26,17 @@ class OcrProcessor {
     companion object {
         private const val TAG = "OcrProcessor"
 
-        // Wider regions for better detection across all phone sizes
-        private val KILLS_REGION = floatArrayOf(0.70f, 0.01f, 0.99f, 0.14f)
-        private val ALIVE_REGION = floatArrayOf(0.65f, 0.08f, 0.99f, 0.22f)
-        private val ROOM_ID_REGION = floatArrayOf(0.00f, 0.15f, 0.45f, 0.40f)
+        // LANDSCAPE mode coordinates
+        // Players Alive — teal box top-right
+        private val ALIVE_REGION = floatArrayOf(0.78f, 0.01f, 0.88f, 0.10f)
+        // Kills — red/skull box top-right
+        private val KILLS_REGION = floatArrayOf(0.88f, 0.01f, 0.99f, 0.10f)
+        // Room ID — bottom of screen (room code)
+        private val ROOM_ID_REGION = floatArrayOf(0.00f, 0.88f, 0.50f, 1.00f)
+        // Death banner — center screen
         private val DEATH_REGION = floatArrayOf(0.20f, 0.35f, 0.80f, 0.65f)
+        // Player list — left side
+        private val PLAYER_LIST_REGION = floatArrayOf(0.00f, 0.12f, 0.22f, 0.48f)
 
         private val NUMBER_REGEX = Regex("\\d+")
         private val ROOM_ID_REGEX = Regex("[A-Z0-9]{6,12}")
@@ -35,7 +44,7 @@ class OcrProcessor {
         private val DEATH_KEYWORDS = listOf(
             "knocked", "eliminated", "defeated", "you died", "killed by",
             "knocked out", "you have been", "finish", "revive", "spectate",
-            "safe", "booyah", "winner", "vehicle", "knocked down"
+            "safe", "booyah", "winner", "knocked down"
         )
     }
 
@@ -44,80 +53,101 @@ class OcrProcessor {
     suspend fun process(bitmap: Bitmap): OcrResult {
         val width = bitmap.width
         val height = bitmap.height
+        Log.d(TAG, "Bitmap: ${width}x${height}")
 
-        Log.d(TAG, "Processing bitmap: ${width}x${height}")
+        val killsText    = runOcr(cropRegion(bitmap, KILLS_REGION, width, height))
+        val aliveText    = runOcr(cropRegion(bitmap, ALIVE_REGION, width, height))
+        val roomIdText   = runOcr(cropRegion(bitmap, ROOM_ID_REGION, width, height))
+        val deathText    = runOcr(cropRegion(bitmap, DEATH_REGION, width, height))
+        val playerListText = runOcr(cropRegion(bitmap, PLAYER_LIST_REGION, width, height))
 
-        val killsText = runOcr(cropRegion(bitmap, KILLS_REGION, width, height))
-        val aliveText = runOcr(cropRegion(bitmap, ALIVE_REGION, width, height))
-        val roomIdText = runOcr(cropRegion(bitmap, ROOM_ID_REGION, width, height))
-        val deathText = runOcr(cropRegion(bitmap, DEATH_REGION, width, height))
+        Log.d(TAG, "kills='$killsText' alive='$aliveText' players='$playerListText'")
 
-        Log.d(TAG, "Raw OCR → kills='$killsText' alive='$aliveText' roomId='$roomIdText' death='$deathText'")
-
-        val kills = extractFirstNumber(killsText)
-        val alive = extractFirstNumber(aliveText)
+        val kills  = extractFirstNumber(killsText)
+        val alive  = extractFirstNumber(aliveText)
         val roomId = extractRoomId(roomIdText)
         val isDead = detectDeath(deathText)
 
-        Log.d(TAG, "Parsed → kills=$kills alive=$alive roomId=$roomId dead=$isDead")
+        // Parse player list — alive vs dead
+        val (activePlayers, deadPlayers) = parsePlayerList(playerListText)
 
         return OcrResult(
             kills = kills,
             playersAlive = alive,
             roomId = roomId,
             playerDeathDetected = isDead,
+            activePlayers = activePlayers,
+            deadPlayers = deadPlayers,
             rawKillsText = killsText,
             rawAliveText = aliveText,
-            rawRoomIdText = roomIdText
+            rawRoomIdText = roomIdText,
+            rawPlayerListText = playerListText
         )
     }
 
-    private fun cropRegion(
-        bitmap: Bitmap,
-        region: FloatArray,
-        width: Int,
-        height: Int
-    ): Bitmap {
-        val left = (region[0] * width).toInt().coerceAtLeast(0)
-        val top = (region[1] * height).toInt().coerceAtLeast(0)
-        val right = (region[2] * width).toInt().coerceAtMost(width)
-        val bottom = (region[3] * height).toInt().coerceAtMost(height)
+    /**
+     * Player list parse karta hai.
+     * Dead player ke aage flag 🏳️ hota hai — OCR mein alag text pattern
+     * Alive players ke aage location pin 📍 hota hai
+     */
+    private fun parsePlayerList(text: String): Pair<List<String>, List<String>> {
+        if (text.isBlank()) return Pair(emptyList(), emptyList())
 
-        val cropWidth = (right - left).coerceAtLeast(1)
-        val cropHeight = (bottom - top).coerceAtLeast(1)
+        val lines = text.lines().filter { it.isNotBlank() }
+        val active = mutableListOf<String>()
+        val dead   = mutableListOf<String>()
 
-        return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight)
+        // Dead player indicators jo OCR mein aate hain
+        val deadIndicators = listOf("eliminated", "dead", "x", "out")
+
+        for (line in lines) {
+            val cleanLine = line.trim()
+            // Number prefix hata do (1,2,3,4)
+            val playerName = cleanLine.replace(Regex("^\\d+\\s*"), "").trim()
+            if (playerName.isBlank()) continue
+
+            // Agar line mein dead indicator ho
+            val isDead = deadIndicators.any { cleanLine.lowercase().contains(it) }
+            if (isDead) {
+                dead.add(playerName)
+            } else {
+                active.add(playerName)
+            }
+        }
+
+        return Pair(active, dead)
+    }
+
+    private fun cropRegion(bitmap: Bitmap, region: FloatArray, w: Int, h: Int): Bitmap {
+        val left   = (region[0] * w).toInt().coerceAtLeast(0)
+        val top    = (region[1] * h).toInt().coerceAtLeast(0)
+        val right  = (region[2] * w).toInt().coerceAtMost(w)
+        val bottom = (region[3] * h).toInt().coerceAtMost(h)
+        return Bitmap.createBitmap(bitmap, left, top,
+            (right - left).coerceAtLeast(1),
+            (bottom - top).coerceAtLeast(1))
     }
 
     private suspend fun runOcr(bitmap: Bitmap): String =
-        suspendCancellableCoroutine { continuation ->
+        suspendCancellableCoroutine { cont ->
             val image = InputImage.fromBitmap(bitmap, 0)
             recognizer.process(image)
-                .addOnSuccessListener { visionText ->
-                    continuation.resume(visionText.text.trim())
-                }
-                .addOnFailureListener { exception ->
-                    Log.w(TAG, "OCR failed for region", exception)
-                    continuation.resume("")
-                }
+                .addOnSuccessListener { cont.resume(it.text.trim()) }
+                .addOnFailureListener { cont.resume("") }
         }
 
-    private fun extractFirstNumber(text: String): Int {
-        return NUMBER_REGEX.find(text)?.value?.toIntOrNull() ?: 0
-    }
+    private fun extractFirstNumber(text: String) =
+        NUMBER_REGEX.find(text)?.value?.toIntOrNull() ?: 0
 
     private fun extractRoomId(text: String): String? {
         if (text.isBlank()) return null
-        val match = ROOM_ID_REGEX.find(text.uppercase())
-        return match?.value?.takeIf { it.length >= 6 }
+        return ROOM_ID_REGEX.find(text.uppercase())?.value?.takeIf { it.length >= 6 }
     }
 
     private fun detectDeath(text: String): Boolean {
         val lower = text.lowercase()
-        return DEATH_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        return DEATH_KEYWORDS.any { lower.contains(it) }
     }
 
-    fun close() {
-        recognizer.close()
-    }
+    fun close() = recognizer.close()
 }
