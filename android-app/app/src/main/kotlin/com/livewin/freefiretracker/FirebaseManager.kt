@@ -1,5 +1,3 @@
-package com.livewin.freefiretracker
-
 import android.util.Log
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
@@ -19,7 +17,7 @@ class FirebaseManager(private val playerId: String) {
         private const val COL_LIVE_SCORES = "liveScores"
         private const val COL_USERS = "users"
         private const val COL_LEADERBOARD = "publicLeaderboard"
-        private const val COL_LIVE_DATA = "liveData"  // ← Naya: web app ke liye
+        private const val COL_LIVE_DATA = "liveData"
     }
 
     private val db = FirebaseFirestore.getInstance()
@@ -88,7 +86,7 @@ class FirebaseManager(private val playerId: String) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 2. LIVE SCORE WRITE — Player ka score + alive/dead status
+    // 2. LIVE SCORE WRITE
     // ─────────────────────────────────────────────────────────────────────────
 
     suspend fun writeLiveScore(
@@ -96,24 +94,24 @@ class FirebaseManager(private val playerId: String) {
         stats: GameStats,
         cheatFlagged: Boolean,
         playerName: String = "",
-        activePlayers: List<String> = emptyList(),   // ← Naya
-        deadPlayers: List<String> = emptyList()      // ← Naya
+        activePlayers: List<String> = emptyList(),
+        deadPlayers: List<String> = emptyList()
     ) {
         val payload = hashMapOf(
-            "playerId"       to playerId,
-            "name"           to playerName,
-            "kills"          to stats.kills,
-            "rank"           to stats.rank,
-            "playersAlive"   to stats.playersAlive,
-            "playerDead"     to stats.playerDead,
-            "cheatFlagged"   to cheatFlagged,
-            "lastUpdated"    to stats.lastUpdated,
-            "activePlayers"  to activePlayers,        // ← Naya
-            "deadPlayers"    to deadPlayers           // ← Naya
+            "playerId"      to playerId,
+            "name"          to playerName,
+            "kills"         to stats.kills,
+            "rank"          to stats.rank,
+            "playersAlive"  to stats.playersAlive,
+            "playerDead"    to stats.playerDead,
+            "cheatFlagged"  to cheatFlagged,
+            "lastUpdated"   to stats.lastUpdated,
+            "activePlayers" to activePlayers,
+            "deadPlayers"   to deadPlayers
         )
 
         try {
-            // liveScores mein write (existing)
+            // liveScores mein write
             db.collection(contest.collectionName)
                 .document(contest.contestId)
                 .collection(COL_LIVE_SCORES)
@@ -121,30 +119,15 @@ class FirebaseManager(private val playerId: String) {
                 .set(payload)
                 .await()
 
-            // ─── WEB APP KE LIYE LIVE DATA ───
-            // contests/{id}/liveData/current — web app yahan se real-time sun-ta hai
-            val liveDataPayload = hashMapOf(
-                "playersAlive"   to stats.playersAlive,
-                "kills"          to stats.kills,
-                "activePlayers"  to activePlayers,
-                "deadPlayers"    to deadPlayers,
-                "playerDead"     to stats.playerDead,
-                "cheatFlagged"   to cheatFlagged,
-                "lastUpdated"    to FieldValue.serverTimestamp(),
-                "trackedBy"      to playerId
+            // Aggregated liveData update karo (cross-verification + web app)
+            updateAggregatedLiveData(
+                contest, playerName, stats,
+                activePlayers, deadPlayers, cheatFlagged
             )
 
-            db.collection(contest.collectionName)
-                .document(contest.contestId)
-                .collection(COL_LIVE_DATA)
-                .document("current")               // ← Web app "current" document listen karta hai
-                .set(liveDataPayload)
-                .await()
-
-            Log.d(TAG, "LiveScore + LiveData written: kills=${stats.kills} " +
+            Log.d(TAG, "LiveScore written: kills=${stats.kills} " +
                     "alive=${stats.playersAlive} " +
-                    "activePlayers=${activePlayers.size} " +
-                    "deadPlayers=${deadPlayers.size}")
+                    "active=${activePlayers.size} dead=${deadPlayers.size}")
 
         } catch (e: Exception) {
             Log.e(TAG, "Error writing live score", e)
@@ -156,8 +139,8 @@ class FirebaseManager(private val playerId: String) {
         stats: GameStats,
         cheatFlagged: Boolean,
         playerName: String = "",
-        activePlayers: List<String> = emptyList(),   // ← Naya
-        deadPlayers: List<String> = emptyList()      // ← Naya
+        activePlayers: List<String> = emptyList(),
+        deadPlayers: List<String> = emptyList()
     ) {
         val contest = activeContest ?: run {
             if (detectedRoomId.isNullOrBlank()) return
@@ -167,7 +150,118 @@ class FirebaseManager(private val playerId: String) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 3. DECLARE WINNERS
+    // 3. AGGREGATED LIVE DATA — Sare players ke packets combine karo
+    //    Web app yahan se real-time data leta hai
+    //    Cross-verification bhi yahan hoti hai
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private suspend fun updateAggregatedLiveData(
+        contest: ContestInfo,
+        playerName: String,
+        stats: GameStats,
+        activePlayers: List<String>,
+        deadPlayers: List<String>,
+        cheatFlagged: Boolean
+    ) {
+        try {
+            // Sare players ke liveScores fetch karo
+            val allScores = db.collection(contest.collectionName)
+                .document(contest.contestId)
+                .collection(COL_LIVE_SCORES)
+                .get().await()
+
+            // Cross-verification: sare players ke packets merge karo
+            val allActive = mutableSetOf<String>()
+            val allDead   = mutableSetOf<String>()
+            var totalKills = 0
+            var mostRecentAlive = stats.playersAlive
+
+            for (doc in allScores.documents) {
+                val d = doc.data ?: continue
+
+                val docActive = (d["activePlayers"] as? List<*>)
+                    ?.map { it.toString() } ?: emptyList()
+                val docDead = (d["deadPlayers"] as? List<*>)
+                    ?.map { it.toString() } ?: emptyList()
+                val docKills = (d["kills"] as? Number)?.toInt() ?: 0
+                val docAlive = (d["playersAlive"] as? Number)?.toInt() ?: 0
+
+                allActive.addAll(docActive)
+                allDead.addAll(docDead)
+                totalKills += docKills
+
+                // Sabse trusted alive count
+                if (docAlive > 0) mostRecentAlive = docAlive
+            }
+
+            // Cross-verify: jo dead hai wo active mein nahi hona chahiye
+            allActive.removeAll(allDead)
+
+            val livePayload = hashMapOf(
+                "playersAlive"   to mostRecentAlive,
+                "totalKills"     to totalKills,
+                "activePlayers"  to allActive.toList(),
+                "deadPlayers"    to allDead.toList(),
+                "playerDead"     to stats.playerDead,
+                "cheatFlagged"   to cheatFlagged,
+                "trackedBy"      to playerName,
+                "trackersCount"  to allScores.documents.size,
+                "lastUpdated"    to FieldValue.serverTimestamp(),
+                "matchStatus"    to "running"
+            )
+
+            db.collection(contest.collectionName)
+                .document(contest.contestId)
+                .collection(COL_LIVE_DATA)
+                .document("current")
+                .set(livePayload)
+                .await()
+
+            Log.d(TAG, "Aggregated liveData: alive=$mostRecentAlive " +
+                    "active=${allActive.size} dead=${allDead.size} " +
+                    "trackers=${allScores.documents.size}")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Aggregation error", e)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. CROSS VERIFY KILL
+    //    Player A ne Player B ko kill kiya — verify karo
+    // ─────────────────────────────────────────────────────────────────────────
+
+    suspend fun crossVerifyKill(
+        contest: ContestInfo,
+        killerPlayerId: String,
+        targetPlayerName: String
+    ): Boolean {
+        return try {
+            val scores = db.collection(contest.collectionName)
+                .document(contest.contestId)
+                .collection(COL_LIVE_SCORES)
+                .get().await()
+
+            // Target player ka document dhundho
+            val targetDoc = scores.documents.find { doc ->
+                val name = doc.data?.get("name")?.toString() ?: ""
+                name.equals(targetPlayerName, ignoreCase = true)
+            }
+
+            val targetDead = targetDoc?.data?.get("playerDead") as? Boolean ?: false
+
+            Log.d(TAG, "CrossVerify: $killerPlayerId killed " +
+                    "$targetPlayerName → confirmed=$targetDead")
+            targetDead
+
+        } catch (e: Exception) {
+            Log.e(TAG, "CrossVerify error", e)
+            false
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. DECLARE WINNERS
     // ─────────────────────────────────────────────────────────────────────────
 
     suspend fun declareWinners(contest: ContestInfo): Boolean {
@@ -227,20 +321,21 @@ class FirebaseManager(private val playerId: String) {
             // Contest complete mark karo
             db.collection(contest.collectionName)
                 .document(contest.contestId)
-                .update(mapOf("winners" to winnersPayload, "status" to "completed"))
-                .await()
+                .update(mapOf(
+                    "winners" to winnersPayload,
+                    "status" to "completed"
+                )).await()
 
-            // LiveData bhi clear karo — web app ko pata chale match khatam
+            // LiveData mein bhi complete mark karo
             db.collection(contest.collectionName)
                 .document(contest.contestId)
                 .collection(COL_LIVE_DATA)
                 .document("current")
                 .update(mapOf(
                     "matchStatus" to "completed",
-                    "winners" to winnersPayload,
+                    "winners"     to winnersPayload,
                     "lastUpdated" to FieldValue.serverTimestamp()
-                ))
-                .await()
+                )).await()
 
             // Coins credit karo
             for (winner in winners) {
@@ -259,7 +354,7 @@ class FirebaseManager(private val playerId: String) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 4. CREDIT COINS
+    // 6. CREDIT COINS
     // ─────────────────────────────────────────────────────────────────────────
 
     private suspend fun creditWinnerCoins(winner: WinnerEntry, contestName: String) {
@@ -267,37 +362,41 @@ class FirebaseManager(private val playerId: String) {
             db.collection(COL_USERS).document(winner.uid).update(
                 mapOf(
                     "winningCoins" to FieldValue.increment(winner.prize.toLong()),
-                    "totalWon" to FieldValue.increment(winner.prize.toLong())
+                    "totalWon"     to FieldValue.increment(winner.prize.toLong())
                 )
             ).await()
 
             try {
                 db.collection(COL_LEADERBOARD).document(winner.uid)
-                    .update("totalWon", FieldValue.increment(winner.prize.toLong())).await()
+                    .update("totalWon",
+                        FieldValue.increment(winner.prize.toLong())).await()
             } catch (e: Exception) {
                 db.collection(COL_LEADERBOARD).document(winner.uid).set(
                     mapOf(
                         "displayName" to winner.name,
-                        "playerId" to winner.playerId,
-                        "totalWon" to winner.prize,
-                        "banned" to false
+                        "playerId"    to winner.playerId,
+                        "totalWon"    to winner.prize,
+                        "banned"      to false
                     )
                 ).await()
             }
 
             val notification = hashMapOf(
-                "icon" to "🏆",
-                "title" to "You Won ₹${winner.prize}! Rank #${winner.rank}",
-                "message" to "Congrats! Rank #${winner.rank} in \"$contestName\" " +
-                        "with ${winner.kills} kills. ₹${winner.prize} credited!",
+                "icon"    to "🏆",
+                "title"   to "You Won ₹${winner.prize}! Rank #${winner.rank}",
+                "message" to "Congrats! Rank #${winner.rank} in " +
+                        "\"$contestName\" with ${winner.kills} kills. " +
+                        "₹${winner.prize} credited!",
                 "read" to false,
                 "time" to System.currentTimeMillis()
             )
 
             db.collection(COL_USERS).document(winner.uid)
-                .update("notifications", FieldValue.arrayUnion(notification)).await()
+                .update("notifications",
+                    FieldValue.arrayUnion(notification)).await()
 
             Log.i(TAG, "Coins credited: ${winner.prize} → ${winner.name}")
+
         } catch (e: Exception) {
             Log.e(TAG, "Error crediting coins", e)
         }
@@ -309,5 +408,7 @@ class FirebaseManager(private val playerId: String) {
 
     fun getActiveContest(): ContestInfo? = activeContest
     fun getActiveContestId(): String? = activeContest?.contestId
+    fun getLastRoomId(): String? = activeContest?.roomId
     fun clearActiveContest() { activeContest = null; winnersDeclared = false }
     fun resetSession() { winnersDeclared = false }
+}
