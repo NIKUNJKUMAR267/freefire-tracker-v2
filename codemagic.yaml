@@ -4,6 +4,8 @@ workflows:
     max_build_duration: 60
     environment:
       java: 17
+      groups:
+        - Live2Win
     scripts:
       - name: Setup Gradle Wrapper
         script: |
